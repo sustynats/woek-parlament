@@ -1,0 +1,47 @@
+name: Deploy static Parliament release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable release tag containing woek-parlament-site.tar.gz
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download immutable site release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" --pattern woek-parlament-site.tar.gz --dir artifact
+      - name: Extract site
+        run: |
+          mkdir site
+          tar -xzf artifact/woek-parlament-site.tar.gz -C site
+          test "$(cat site/CNAME)" = "parlament.wirkungsoekonomie.de"
+          test -f site/_woek-build-manifest.json
+          test -f site/index.html
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload static site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
