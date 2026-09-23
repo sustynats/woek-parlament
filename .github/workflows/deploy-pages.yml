@@ -1,12 +1,16 @@
-name: Deploy static Parliament release
+name: Deploy verified Parliament snapshot
 
 on:
+  schedule:
+    - cron: "50 6,16 * * *"
+      timezone: "Europe/Berlin"
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: Immutable release tag containing woek-parlament-site.tar.gz
-        required: true
-        type: string
+      force:
+        description: Build even when the live fingerprint already matches
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -18,30 +22,85 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.release.outputs.deploy }}
+      fingerprint: ${{ steps.release.outputs.fingerprint }}
+      source_commit: ${{ steps.release.outputs.source_commit }}
+    steps:
+      - id: release
+        name: Compare verified source and live release fingerprints
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_DEPLOY: ${{ inputs.force || 'false' }}
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/sustynats/wirkungsoekonomie.de/main/.github/static-release-trigger.json" -o trigger.json
+          fingerprint="$(jq -er '.fingerprint | select(test("^[a-f0-9]{64}$"))' trigger.json)"
+          source_commit="$(gh api -X GET repos/sustynats/wirkungsoekonomie.de/commits -f path=.github/static-release-trigger.json -f per_page=1 --jq '.[0].sha')"
+          test -n "$source_commit"
+          live_fingerprint="$(curl -fsSL --max-time 20 https://parlament.wirkungsoekonomie.de/_woek-build-manifest.json 2>/dev/null | jq -r '.source_fingerprint // empty' || true)"
+          deploy=false
+          if test "$FORCE_DEPLOY" = "true" || test "$fingerprint" != "$live_fingerprint"; then deploy=true; fi
+          {
+            echo "deploy=$deploy"
+            echo "fingerprint=$fingerprint"
+            echo "source_commit=$source_commit"
+          } >> "$GITHUB_OUTPUT"
+          echo "DEPLOY_REQUIRED=$deploy"
+
+  deploy:
+    needs: plan
+    if: needs.plan.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Download immutable site release
+      - name: Check out the immutable verified source commit
+        uses: actions/checkout@v4
+        with:
+          repository: sustynats/wirkungsoekonomie.de
+          ref: ${{ needs.plan.outputs.source_commit }}
+          path: source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: source/woek-parlament-app/package-lock.json
+      - name: Verify the selected release trigger
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" --pattern woek-parlament-site.tar.gz --dir artifact
-      - name: Extract site
+          EXPECTED_FINGERPRINT: ${{ needs.plan.outputs.fingerprint }}
+        run: test "$(jq -r .fingerprint source/.github/static-release-trigger.json)" = "$EXPECTED_FINGERPRINT"
+      - name: Install the locked public build dependencies
+        working-directory: source/woek-parlament-app
+        run: npm ci --ignore-scripts
+      - name: Build and validate the static public site
+        working-directory: source/woek-parlament-app
+        env:
+          WOEK_AUTOPILOT_RUNTIME_MODE: INITIAL_BOOTSTRAP_2_3
+          WOEK_SOURCE_COMMIT: ${{ needs.plan.outputs.source_commit }}
+          WOEK_SOURCE_FINGERPRINT: ${{ needs.plan.outputs.fingerprint }}
+        run: npm run build:static-public
+      - name: Verify release identity and static-only boundary
+        env:
+          EXPECTED_COMMIT: ${{ needs.plan.outputs.source_commit }}
+          EXPECTED_FINGERPRINT: ${{ needs.plan.outputs.fingerprint }}
         run: |
-          mkdir site
-          tar -xzf artifact/woek-parlament-site.tar.gz -C site
-          test "$(cat site/CNAME)" = "parlament.wirkungsoekonomie.de"
-          test -f site/_woek-build-manifest.json
-          test -f site/index.html
+          manifest=source/woek-parlament-app/_static-public-site/_woek-build-manifest.json
+          test "$(jq -r .source_commit "$manifest")" = "$EXPECTED_COMMIT"
+          test "$(jq -r .source_fingerprint "$manifest")" = "$EXPECTED_FINGERPRINT"
+          test "$(cat source/woek-parlament-app/_static-public-site/CNAME)" = "parlament.wirkungsoekonomie.de"
+          test -f source/woek-parlament-app/_static-public-site/index.html
+          test ! -d source/woek-parlament-app/_static-public-site/api
       - name: Configure Pages
         uses: actions/configure-pages@v5
       - name: Upload static site
         uses: actions/upload-pages-artifact@v4
         with:
-          path: site
+          path: source/woek-parlament-app/_static-public-site
+          retention-days: 1
       - name: Deploy Pages
         id: deployment
         uses: actions/deploy-pages@v4
