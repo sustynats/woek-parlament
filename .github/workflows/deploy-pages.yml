@@ -6,101 +6,131 @@ on:
       timezone: "Europe/Berlin"
   workflow_dispatch:
     inputs:
-      force:
-        description: Build even when the live fingerprint already matches
-        required: false
-        default: false
-        type: boolean
+      asset_id:
+        description: GitHub Release asset ID in this repository (tar.gz)
+        required: true
+        type: string
+      archive_sha256:
+        description: SHA-256 of the locally verified public archive
+        required: true
+        type: string
+      source_commit:
+        description: Full commit SHA in wirkungsoekonomie-produktiv
+        required: true
+        type: string
+      source_fingerprint:
+        description: Static release trigger fingerprint for the exact source commit
+        required: true
+        type: string
+      previous_fingerprint:
+        description: Fingerprint currently served by Parliament Pages
+        required: true
+        type: string
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
   cancel-in-progress: false
 
 jobs:
-  plan:
+  legacy-watch:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    outputs:
-      deploy: ${{ steps.release.outputs.deploy }}
-      fingerprint: ${{ steps.release.outputs.fingerprint }}
-      source_commit: ${{ steps.release.outputs.source_commit }}
     steps:
-      - id: release
-        name: Compare verified source and live release fingerprints
+      - name: Check the frozen legacy source without publishing it
+        env:
+          LEGACY_FINGERPRINT: 2a46bbafa5e6906a2855e7e70b34935ad13cb7ced21e83a64bc0678c6795a726
+          LEGACY_COMMIT: 4227bca20b7c2bd0500e0ec1206710595d996966
+        run: |
+          set -euo pipefail
+          live="$(curl -fsSL --max-time 25 https://parlament.wirkungsoekonomie.de/_woek-build-manifest.json)"
+          live_fingerprint="$(jq -er '.source_fingerprint | select(test("^[a-f0-9]{64}$"))' <<< "$live")"
+          live_commit="$(jq -er '.source_commit | select(test("^[a-f0-9]{40}$"))' <<< "$live")"
+          if [[ "$live_fingerprint" != "$LEGACY_FINGERPRINT" ]]; then
+            echo "Pages is serving a different verified release. Legacy publication is locked."
+            exit 0
+          fi
+          test "$live_commit" = "$LEGACY_COMMIT"
+          trigger="$(curl -fsSL --max-time 25 https://raw.githubusercontent.com/sustynats/wirkungsoekonomie.de/main/.github/static-release-trigger.json)"
+          test "$(jq -er '.fingerprint' <<< "$trigger")" = "$LEGACY_FINGERPRINT"
+          echo "Pages is serving the frozen legacy release. The next release requires a verified asset."
+
+  verify:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require the trusted publishing branch
+        run: test "$GITHUB_REF" = refs/heads/main
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check the current publication boundary
+        env:
+          EXPECTED_PREVIOUS_FINGERPRINT: ${{ inputs.previous_fingerprint }}
+        run: |
+          set -euo pipefail
+          live="$(curl -fsSL --max-time 25 https://parlament.wirkungsoekonomie.de/_woek-build-manifest.json)"
+          test "$(jq -er '.source_fingerprint | select(test("^[a-f0-9]{64}$"))' <<< "$live")" = "$EXPECTED_PREVIOUS_FINGERPRINT"
+      - name: Download the identified release asset and verify the digest
         env:
           GH_TOKEN: ${{ github.token }}
-          FORCE_DEPLOY: ${{ inputs.force || 'false' }}
+          ASSET_ID: ${{ inputs.asset_id }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/sustynats/wirkungsoekonomie.de/main/.github/static-release-trigger.json" -o trigger.json
-          fingerprint="$(jq -er '.fingerprint | select(test("^[a-f0-9]{64}$"))' trigger.json)"
-          source_commit="$(gh api -X GET repos/sustynats/wirkungsoekonomie.de/commits -f path=.github/static-release-trigger.json -f per_page=1 --jq '.[0].sha')"
-          test -n "$source_commit"
-          live_fingerprint="$(curl -fsSL --max-time 20 https://parlament.wirkungsoekonomie.de/_woek-build-manifest.json 2>/dev/null | jq -r '.source_fingerprint // empty' || true)"
-          deploy=false
-          if test "$FORCE_DEPLOY" = "true" || test "$fingerprint" != "$live_fingerprint"; then deploy=true; fi
-          {
-            echo "deploy=$deploy"
-            echo "fingerprint=$fingerprint"
-            echo "source_commit=$source_commit"
-          } >> "$GITHUB_OUTPUT"
-          echo "DEPLOY_REQUIRED=$deploy"
+          set -euo pipefail
+          [[ "$ASSET_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARCHIVE_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          endpoint="repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"
+          gh api "$endpoint" | jq -e             --arg id "$ASSET_ID" --arg digest "sha256:$ARCHIVE_SHA256"             '(.id | tostring) == $id and .state == "uploaded" and .digest == $digest and (.name | endswith(".tar.gz"))' > /dev/null
+          gh api -H 'Accept: application/octet-stream' "$endpoint" > "$RUNNER_TEMP/parliament.tar.gz"
+          printf '%s  %s\n' "$ARCHIVE_SHA256" "$RUNNER_TEMP/parliament.tar.gz" | sha256sum --check --strict
+      - name: Prepare static Pages output
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_FINGERPRINT: ${{ inputs.source_fingerprint }}
+        run: |
+          python3 .github/scripts/verify-release.py "$RUNNER_TEMP/parliament.tar.gz" "$RUNNER_TEMP/pages" "$SOURCE_COMMIT" "$SOURCE_FINGERPRINT"
+      - name: Upload the verified static site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/pages
+          retention-days: 1
 
   deploy:
-    needs: plan
-    if: needs.plan.outputs.deploy == 'true'
+    needs: verify
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Check out the immutable verified source commit
-        uses: actions/checkout@v4
-        with:
-          repository: sustynats/wirkungsoekonomie.de
-          ref: ${{ needs.plan.outputs.source_commit }}
-          path: source
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: source/woek-parlament-app/package-lock.json
-      - name: Verify the selected release trigger
+      - name: Verify the live release immediately before replacing it
         env:
-          EXPECTED_FINGERPRINT: ${{ needs.plan.outputs.fingerprint }}
-        run: test "$(jq -r .fingerprint source/.github/static-release-trigger.json)" = "$EXPECTED_FINGERPRINT"
-      - name: Install the locked public build dependencies
-        working-directory: source/woek-parlament-app
-        run: npm ci --ignore-scripts
-      - name: Build and validate the static public site
-        working-directory: source/woek-parlament-app
-        env:
-          WOEK_AUTOPILOT_RUNTIME_MODE: INITIAL_BOOTSTRAP_2_3
-          WOEK_SOURCE_COMMIT: ${{ needs.plan.outputs.source_commit }}
-          WOEK_SOURCE_FINGERPRINT: ${{ needs.plan.outputs.fingerprint }}
-        run: npm run build:static-public
-      - name: Verify release identity and static-only boundary
-        env:
-          EXPECTED_COMMIT: ${{ needs.plan.outputs.source_commit }}
-          EXPECTED_FINGERPRINT: ${{ needs.plan.outputs.fingerprint }}
+          EXPECTED_PREVIOUS_FINGERPRINT: ${{ inputs.previous_fingerprint }}
         run: |
-          manifest=source/woek-parlament-app/_static-public-site/_woek-build-manifest.json
-          test "$(jq -r .source_commit "$manifest")" = "$EXPECTED_COMMIT"
-          test "$(jq -r .source_fingerprint "$manifest")" = "$EXPECTED_FINGERPRINT"
-          test "$(cat source/woek-parlament-app/_static-public-site/CNAME)" = "parlament.wirkungsoekonomie.de"
-          test -f source/woek-parlament-app/_static-public-site/index.html
-          test ! -d source/woek-parlament-app/_static-public-site/api
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-      - name: Upload static site
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: source/woek-parlament-app/_static-public-site
-          retention-days: 1
+          set -euo pipefail
+          live="$(curl -fsSL --max-time 25 https://parlament.wirkungsoekonomie.de/_woek-build-manifest.json)"
+          test "$(jq -er '.source_fingerprint | select(test("^[a-f0-9]{64}$"))' <<< "$live")" = "$EXPECTED_PREVIOUS_FINGERPRINT"
       - name: Deploy Pages
         id: deployment
         uses: actions/deploy-pages@v4
+      - name: Verify that Pages serves the selected release
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_FINGERPRINT: ${{ inputs.source_fingerprint }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..15}; do
+            if curl -fsSL --max-time 15 -H 'Cache-Control: no-cache' "https://parlament.wirkungsoekonomie.de/_woek-build-manifest.json?check=$GITHUB_RUN_ID-$attempt" |
+              jq -e --arg commit "$SOURCE_COMMIT" --arg fingerprint "$SOURCE_FINGERPRINT"                 '.source_commit == $commit and .source_fingerprint == $fingerprint' > /dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "The live manifest has not confirmed the selected release." >&2
+          exit 1
